@@ -7998,7 +7998,6 @@ local function main()
 			self.LastAnimTime = animTime
 
 			if not on then return end
-
 			lineTweens.Invis:Cancel()
 			lineTweens.Vis:Cancel()
 			cursor.BackgroundTransparency = 0
@@ -14471,7 +14470,7 @@ Main = (function()
 		if Main.Elevated then -- If you don't have filesystem api then ur outta luck tbh
 			local control
 
-			if EmbeddedModules then -- Offline Modules
+			if EmbeddedModules and EmbeddedModules[name] then -- Offline Modules (prefer embedded when present)
 				control = EmbeddedModules[name]()
 
 				-- TODO: Remove when open source
@@ -14481,16 +14480,43 @@ Main = (function()
 
 				if not control then Main.Error("Missing Embedded Module: "..name) end
 			else
-				-- Get hash data
+				-- Get hash data (with on-disk cache, TTL 1h)
 				local hashs = Main.ModuleHashData
 				if not hashs then
-					local s,hashDataStr = pcall(oldgame.HttpGet, game, "https://api.github.com/repos/"..Main.GitRepoName.."/ModuleHashs.dat")
-					if not s then Main.Error("Failed to get module hashs") end
+					local cachePath = "dex/ModuleHashs.cache.json"
+					local cacheMetaPath = "dex/ModuleHashs.cache.time"
+					local useDiskCache = false
 
-					local s,hashData = pcall(service.HttpService.JSONDecode,service.HttpService,hashDataStr)
-					if not s then Main.Error("Failed to decode module hash JSON") end
+					if env.readfile and env.isfile then
+						local okT, timeStr = pcall(env.readfile, cacheMetaPath)
+						local okC, cachedStr = pcall(env.readfile, cachePath)
+						if okT and okC and timeStr and cachedStr then
+							local cachedTime = tonumber(timeStr)
+							if cachedTime and (os.time() - cachedTime) < 3600 then
+								local okD, decoded = pcall(service.HttpService.JSONDecode, service.HttpService, cachedStr)
+								if okD and decoded then
+									hashs = decoded
+									useDiskCache = true
+								end
+							end
+						end
+					end
 
-					hashs = hashData
+					if not useDiskCache then
+						local s,hashDataStr = pcall(oldgame.HttpGet, game, "https://api.github.com/repos/"..Main.GitRepoName.."/ModuleHashs.dat")
+						if not s then Main.Error("Failed to get module hashs") end
+
+						local s,hashData = pcall(service.HttpService.JSONDecode,service.HttpService,hashDataStr)
+						if not s then Main.Error("Failed to decode module hash JSON") end
+
+						hashs = hashData
+
+						if env.writefile then
+							pcall(env.writefile, cachePath, hashDataStr)
+							pcall(env.writefile, cacheMetaPath, tostring(os.time()))
+						end
+					end
+
 					Main.ModuleHashData = hashs
 				end
 
@@ -14499,14 +14525,14 @@ Main = (function()
 				local filePath = "dex/ModuleCache/"..name..".lua"
 				local s,moduleStr = pcall(env.readfile,filePath)
 
-				if s and hashfunc(moduleStr) == hashs[name] then
+				if s and moduleStr and hashfunc(moduleStr) == hashs[name] then
 					control = loadstring(moduleStr)()
 				else
 					-- Download and cache
 					local s,moduleStr = pcall(oldgame.HttpGet, game, "https://api.github.com/repos/"..Main.GitRepoName.."/Modules/"..name..".lua")
 					if not s then Main.Error("Failed to get external module data of "..name) end
 
-					env.writefile(filePath,moduleStr)
+					if env.writefile then pcall(env.writefile, filePath, moduleStr) end
 					control = loadstring(moduleStr)()
 				end
 			end
@@ -14998,26 +15024,28 @@ Main = (function()
 		local downloaded = false
 		local api,rawAPI
 		if Main.Elevated then
-			if Main.LocalDepsUpToDate() then
-				local localAPI = Lib.ReadFile("dex/rbx_api.dat")
-				if localAPI then 
-					rawAPI = localAPI
-				else
-					Main.DepsVersionData[1] = ""
-				end
+			-- Always try local cache first (even if version mismatch, TTL handled in LocalDepsUpToDate)
+			local localAPI = Lib.ReadFile("dex/rbx_api.dat")
+			if localAPI and #localAPI > 1000 then
+				rawAPI = localAPI
 			end
-			task.spawn(function()
-				task.wait(10)
-				if not downloaded and callbackiflong then callbackiflong() end
 
-				task.wait(20) -- 30
-				if not downloaded and callbackiftoolong then callbackiftoolong() end
+			if not rawAPI then
+				task.spawn(function()
+					task.wait(10)
+					if not downloaded and callbackiflong then callbackiflong() end
 
-				task.wait(30) -- 60
-				if not downloaded and XD then XD() end
-			end)
-			-- lmfao async makes it work to load big file
-			rawAPI = rawAPI or game:HttpGet("http://setup.roblox.com/"..Main.RobloxVersion.."-API-Dump.json")
+					task.wait(20) -- 30
+					if not downloaded and callbackiftoolong then callbackiftoolong() end
+
+					task.wait(30) -- 60
+					if not downloaded and XD then XD() end
+				end)
+
+				local url = "http://setup.roblox.com/"..Main.RobloxVersion.."-API-Dump.json"
+				local res = env.request and env.request({Url = url, Method = "GET"})
+				rawAPI = (res and res.Body) or game:HttpGet(url)
+			end
 		else
 			if script:FindFirstChild("API") then
 				rawAPI = require(script.API)
@@ -15159,15 +15187,17 @@ Main = (function()
 	Main.FetchRMD = function()
 		local rawXML
 		if Main.Elevated then
-			if Main.LocalDepsUpToDate() then
-				local localRMD = Lib.ReadFile("dex/rbx_rmd.dat")
-				if localRMD then 
-					rawXML = localRMD
-				else
-					Main.DepsVersionData[1] = ""
-				end
+			-- Always try local cache first
+			local localRMD = Lib.ReadFile("dex/rbx_rmd.dat")
+			if localRMD and #localRMD > 1000 then
+				rawXML = localRMD
 			end
-			rawXML = rawXML or game:HttpGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-Client-Tracker/roblox/ReflectionMetadata.xml")
+
+			if not rawXML then
+				local url = "https://raw.githubusercontent.com/CloneTrooper1019/Roblox-Client-Tracker/roblox/ReflectionMetadata.xml"
+				local res = env.request and env.request({Url = url, Method = "GET"})
+				rawXML = (res and res.Body) or game:HttpGet(url)
+			end
 		else
 			if script:FindFirstChild("RMD") then
 				rawXML = require(script.RMD)
@@ -15698,13 +15728,20 @@ Main = (function()
 	end
 
 	Main.LocalDepsUpToDate = function()
-		return Main.DepsVersionData and Main.ClientVersion == Main.DepsVersionData[1]
+		if not Main.DepsVersionData then return false end
+		if Main.ClientVersion == Main.DepsVersionData[1] then return true end
+		-- Allow stale cache for up to 3 days if version mismatch
+		local cacheTime = tonumber(Main.DepsVersionData[3])
+		if cacheTime and (os.time() - cacheTime) < (3 * 86400) then
+			return true
+		end
+		return false
 	end
 
-	Main.Init = function()
+	 = function()
 		Main.Elevated = pcall(function() local a = game:GetService("CoreGui"):GetFullName() end)
 		
-		-- saves new settings if does not exist
+		-- saves new settings if doesMain.Init not exist
 		if isfile and not isfile("DexPlusPlusSettings.json") then
 			Main.SaveCurrentSettings()
 		end
@@ -15759,22 +15796,76 @@ Main = (function()
 			Main.RobloxVersion = Main.RobloxVersion or oldgame:HttpGet("https://clientsettings.roblox.com/v2/client-version/WindowsStudio64/channel/LIVE"):match("(version%-[%w]+)")
 		end
 
-		-- Fetch external deps
-		intro.SetProgress("Fetching API",0.35)
-		API = Main.FetchAPI(
-			function()
-				intro.SetProgress("Fetching API, Please Wait.",0.4)
-			end,
-			function()
-				intro.SetProgress("Fetching API, Please Wait Due To Huge API File To Download.",0.45)
-			end,
-			function()
-				intro.SetProgress("Fetching API, LOL STILL DOWNlOADING? bad wifi xD",0.475)
+				-- Fetch external deps (parallel)
+		intro.SetProgress("Fetching API & RMD", 0.35)
+
+		local apiResult, rmdResult
+		local apiDone, rmdDone = false, false
+		local apiErr, rmdErr
+		local fetchStart = tick()
+
+		-- API thread (with its progress callbacks, unchanged)
+		task.spawn(function()
+			local ok, res = pcall(Main.FetchAPI,
+				function()
+					if not rmdDone then
+						intro.SetProgress("Fetching API, Please Wait.", 0.4)
+					end
+				end,
+				function()
+					if not rmdDone then
+						intro.SetProgress("Fetching API, Please Wait Due To Huge API File To Download.", 0.45)
+					end
+				end,
+				function()
+					if not rmdDone then
+						intro.SetProgress("Fetching API, LOL STILL DOWNlOADING? bad wifi xD", 0.475)
+					end
+				end
+			)
+			if ok then
+				apiResult = res
+			else
+				apiErr = res
 			end
-		)
-		Lib.FastWait()
-		intro.SetProgress("Fetching RMD",0.5)
-		RMD = Main.FetchRMD()
+			apiDone = true
+		end)
+
+		-- RMD thread
+		task.spawn(function()
+			local ok, res = pcall(Main.FetchRMD)
+			if ok then
+				rmdResult = res
+			else
+				rmdErr = res
+			end
+			rmdDone = true
+		end)
+
+		-- Wait for both, updating progress as each finishes
+		do
+			while not (apiDone and rmdDone) do
+				local doneCount = (apiDone and 1 or 0) + (rmdDone and 1 or 0)
+				if doneCount == 1 then
+					local status = apiDone
+						and "Fetching RMD, Please Wait."
+						or  "Fetching API, Please Wait."
+					intro.SetProgress(status, 0.5)
+				end
+				Lib.FastWait()
+			end
+		end
+
+		if not apiDone or apiErr then
+			error("Failed to fetch API: " .. tostring(apiErr))
+		end
+		if not rmdDone or rmdErr then
+			error("Failed to fetch RMD: " .. tostring(rmdErr))
+		end
+
+		API = apiResult
+		RMD = rmdResult
+		intro.SetProgress("API & RMD Loaded", 0.55)
 		Lib.FastWait()
 
 		-- Save external deps locally if needed
